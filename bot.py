@@ -21,6 +21,7 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "sent.json"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "60"))
 SEND_EXISTING_ON_FIRST_RUN = os.getenv("SEND_EXISTING_ON_FIRST_RUN", "false").lower() == "true"
+MODE = os.getenv("MODE", "monitor").lower()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -273,6 +274,20 @@ def main() -> None:
 
     listings = scrape_olx()
     current_ids = {item["id"] for item in listings}
+
+    if MODE == "latest10":
+        latest = listings[:10]
+        logger.info("Latest10 mode: sending %s listings", len(latest))
+        for item in reversed(latest):
+            send_listing(item)
+            sent_ids.add(item["id"])
+        state["initialized"] = True
+        state["sent_ids"] = sorted(set([*sent_ids, *current_ids]))[-2500:]
+        save_state(state)
+        return
+
+    if MODE != "monitor":
+        raise RuntimeError(f"Unknown MODE: {MODE}")
 
     if not state["initialized"] and not SEND_EXISTING_ON_FIRST_RUN:
         state["initialized"] = True
