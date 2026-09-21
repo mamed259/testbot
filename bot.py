@@ -28,7 +28,6 @@ EXCLUDED_LOCATIONS = [
     "bemowo",
     "ursus",
 ]
-SEND_EXISTING_ON_FIRST_RUN = os.getenv("SEND_EXISTING_ON_FIRST_RUN", "false").lower() == "true"
 MODE = os.getenv("MODE", "monitor").lower()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -80,6 +79,96 @@ def split_location_date(value: str) -> tuple[str, str]:
 def is_excluded_location(location: str) -> bool:
     normalized = clean_text(location).casefold()
     return any(excluded in normalized for excluded in EXCLUDED_LOCATIONS)
+
+
+
+def extract_publication_data(detail_page) -> tuple[str, str]:
+    """Return (published_at, modified_at) from an OLX listing detail page.
+
+    OLX detail pages can expose exact "Data dodania" / "Data modyfikacji"
+    values in the rendered text. We also check common metadata fields first.
+    """
+    published_at = ""
+    modified_at = ""
+
+    for selector in [
+        'meta[property="article:published_time"]',
+        'meta[itemprop="datePublished"]',
+        'meta[name="datePublished"]',
+    ]:
+        try:
+            value = detail_page.locator(selector).first.get_attribute("content") or ""
+            if value:
+                published_at = clean_text(value)
+                break
+        except Exception:
+            pass
+
+    for selector in [
+        'meta[property="article:modified_time"]',
+        'meta[itemprop="dateModified"]',
+        'meta[name="dateModified"]',
+    ]:
+        try:
+            value = detail_page.locator(selector).first.get_attribute("content") or ""
+            if value:
+                modified_at = clean_text(value)
+                break
+        except Exception:
+            pass
+
+    try:
+        body_text = clean_text(detail_page.locator("body").inner_text(timeout=5_000))
+    except Exception:
+        body_text = ""
+
+    if not published_at:
+        match = re.search(r"Data dodania\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
+        if match:
+            published_at = match.group(1)
+
+    if not modified_at:
+        match = re.search(r"Data modyfikacji\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
+        if match:
+            modified_at = match.group(1)
+
+    return published_at, modified_at
+
+
+def enrich_publication_data(items: list[dict]) -> list[dict]:
+    """Fetch exact publication dates only for items that are about to be sent."""
+    if not items:
+        return items
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="pl-PL",
+            timezone_id="Europe/Warsaw",
+            viewport={"width": 1440, "height": 1200},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        try:
+            for item in items:
+                try:
+                    page.goto(item["url"], wait_until="domcontentloaded", timeout=45_000)
+                    page.wait_for_timeout(700)
+                    published_at, modified_at = extract_publication_data(page)
+                    if published_at:
+                        item["published_at"] = published_at
+                    if modified_at:
+                        item["modified_at"] = modified_at
+                except Exception as exc:
+                    logger.warning("Could not fetch publication date for %s: %s", item.get("id"), exc)
+        finally:
+            context.close()
+            browser.close()
+
+    return items
 
 
 def scrape_olx() -> list[dict]:
@@ -274,14 +363,21 @@ def send_listing(item: dict) -> None:
     price = item.get("price") or "Цена не указана"
     location = item.get("location") or "Локация не указана"
     posted_at = item.get("posted_at") or "Время не указано"
+    published_at = item.get("published_at")
+    modified_at = item.get("modified_at")
     size = item.get("size")
 
     lines = [
         f"🏠 {title}",
         f"💰 {price}",
         f"📍 {location}",
-        f"🕒 {posted_at}",
     ]
+    if published_at:
+        lines.append(f"📅 Dodano: {published_at}")
+    if modified_at:
+        lines.append(f"🔄 Zmodyfikowano: {modified_at}")
+    elif posted_at:
+        lines.append(f"🕒 {posted_at}")
     if size:
         lines.append(f"📐 {size}")
     text = "\n".join(lines)
@@ -321,7 +417,11 @@ def send_listing(item: dict) -> None:
 
 
 def main() -> None:
-    missing = [name for name, value in (("OLX_URL", OLX_URL), ("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID)) if not value]
+    missing = [
+        name
+        for name, value in (("OLX_URL", OLX_URL), ("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID))
+        if not value
+    ]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
@@ -333,11 +433,24 @@ def main() -> None:
     current_ids = {item["id"] for item in listings}
 
     if MODE == "latest10":
-        latest = listings[:10]
-        logger.info("Latest10 mode: sending %s listings", len(latest))
+        # Safe preview mode: never send already-known/old IDs and never run as a
+        # replacement for the initialization step. This prevents a manual test
+        # from spamming old listings.
+        if not state["initialized"]:
+            state["initialized"] = True
+            state["sent_ids"] = sorted(current_ids)
+            save_state(state)
+            logger.info("Latest10 preview skipped on uninitialized state; state initialized with current listings")
+            return
+
+        candidates = [item for item in listings if item["id"] not in sent_ids]
+        latest = candidates[:10]
+        logger.info("Latest10 mode: %s unseen listings", len(latest))
+        latest = enrich_publication_data(latest)
         for item in reversed(latest):
             send_listing(item)
             sent_ids.add(item["id"])
+
         state["initialized"] = True
         state["sent_ids"] = sorted(set([*sent_ids, *current_ids]))[-2500:]
         save_state(state)
@@ -346,7 +459,9 @@ def main() -> None:
     if MODE != "monitor":
         raise RuntimeError(f"Unknown MODE: {MODE}")
 
-    if not state["initialized"] and not SEND_EXISTING_ON_FIRST_RUN:
+    # First monitor run establishes a baseline and sends nothing. This is the
+    # key rule that prevents existing OLX listings from arriving as "new".
+    if not state["initialized"]:
         state["initialized"] = True
         state["sent_ids"] = sorted(current_ids)
         save_state(state)
@@ -359,12 +474,12 @@ def main() -> None:
     new_items = [item for item in listings if item["id"] not in sent_ids]
 
     # OLX is sorted newest-first, so Telegram receives the oldest new item first.
+    new_items = enrich_publication_data(new_items)
     for item in reversed(new_items):
         send_listing(item)
         sent_ids.add(item["id"])
         logger.info("Sent listing %s", item["id"])
 
-    # Keep state bounded while retaining enough history for duplicate prevention.
     merged = list(dict.fromkeys([*sent_ids, *current_ids]))
     state["initialized"] = True
     state["sent_ids"] = merged[-2500:]

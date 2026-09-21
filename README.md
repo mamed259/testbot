@@ -1,42 +1,22 @@
-# OLX → Telegram monitor
+# OLX Telegram Monitor
 
-Checks the configured OLX search page with Playwright and sends listings to Telegram.
+Monitors an OLX Poland rental search page and sends only unseen listings to Telegram.
 
-## Current filters
+## Behavior
+- First `monitor` run creates a baseline from current OLX cards and sends **nothing**.
+- Later `monitor` runs send only listing IDs that were not seen before.
+- Excludes: Praga-Południe, Białołęka, Bielany, Bemowo, Ursus.
+- Includes title, price, location, area, OLX refresh time, and (when available on the detail page) exact `Data dodania` / `Data modyfikacji`.
+- `latest10` is a safe manual preview: it only sends unseen listings and does not send already-known old listings. On an uninitialized state it initializes the baseline and sends nothing.
 
-The scraper skips these Warsaw districts:
-
-- Praga-Południe
-- Białołęka
-- Bielany
-- Bemowo
-
-The Telegram message includes:
-
-- title
-- price
-- location
-- OLX date/status, e.g. `Odświeżono dzisiaj o 23:15`
-- size when available
-- listing image when available
-- button to open the listing
-
-## Modes
-
-- `monitor`: normal mode. On the first run it stores the existing listings and sends only future new listings.
-- `latest10`: manual mode. Sends the 10 newest listings that pass the location filter.
-
-## GitHub Actions
-
-Add repository secrets:
-
+## GitHub Secrets
+- `OLX_URL`
 - `BOT_TOKEN`
 - `CHAT_ID`
-- `OLX_URL`
 
-Run **Actions → OLX monitor → Run workflow**. Choose `latest10` to preview the newest filtered listings in Telegram, or `monitor` for normal monitoring.
-
-Scheduled runs use `monitor` automatically.
-
-
-Excluded districts currently include Praga-Południe, Białołęka, Bielany, Bemowo, and Ursus.
+## Run locally
+```bash
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium
+python bot.py
+```

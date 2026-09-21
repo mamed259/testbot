@@ -52,7 +52,6 @@ class ParserTests(unittest.TestCase):
         ]:
             self.assertTrue(is_excluded_location(location))
 
-        self.assertFalse(is_excluded_location("Warszawa, Ursus"))
         self.assertFalse(is_excluded_location("Warszawa, Mokotów"))
 
 
