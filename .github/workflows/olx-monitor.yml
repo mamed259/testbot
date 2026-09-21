@@ -1,0 +1,51 @@
+name: OLX monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: olx-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-olx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run OLX monitor
+        env:
+          OLX_URL: ${{ secrets.OLX_URL }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python bot.py
+
+      - name: Save state
+        run: |
+          git config user.name "olx-monitor[bot]"
+          git config user.email "olx-monitor[bot]@users.noreply.github.com"
+          git add sent.json
+          git diff --cached --quiet || (
+            git commit -m "chore: update OLX state" &&
+            git push
+          )
