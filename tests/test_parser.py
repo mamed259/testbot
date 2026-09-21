@@ -1,6 +1,12 @@
 import unittest
 
-from bot import listing_id, normalize_url, parse_listing_card
+from bot import (
+    is_excluded_location,
+    listing_id,
+    normalize_url,
+    parse_listing_card,
+    split_location_date,
+)
 
 
 class ParserTests(unittest.TestCase):
@@ -29,6 +35,25 @@ class ParserTests(unittest.TestCase):
             "https://www.olx.pl/d/oferta/mieszkanie-2-pokoje-IDxyz789.html",
         )
         self.assertIn("Mokotów", item["text"])
+
+    def test_split_location_date(self):
+        location, posted_at = split_location_date(
+            "Warszawa, Ursus - Odświeżono dzisiaj o 23:15"
+        )
+        self.assertEqual(location, "Warszawa, Ursus")
+        self.assertEqual(posted_at, "Odświeżono dzisiaj o 23:15")
+
+    def test_excluded_locations(self):
+        for location in [
+            "Warszawa, Praga-Południe",
+            "Warszawa, Białołęka",
+            "Warszawa, Bielany",
+            "Warszawa, Bemowo",
+        ]:
+            self.assertTrue(is_excluded_location(location))
+
+        self.assertFalse(is_excluded_location("Warszawa, Ursus"))
+        self.assertFalse(is_excluded_location("Warszawa, Mokotów"))
 
 
 if __name__ == "__main__":

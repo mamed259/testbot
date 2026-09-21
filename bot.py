@@ -20,6 +20,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "sent.json"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "60"))
+EXCLUDED_LOCATIONS = [
+    "praga-południe",
+    "praga południe",
+    "białołęka",
+    "bielany",
+    "bemowo",
+    "ursus",
+]
 SEND_EXISTING_ON_FIRST_RUN = os.getenv("SEND_EXISTING_ON_FIRST_RUN", "false").lower() == "true"
 MODE = os.getenv("MODE", "monitor").lower()
 
@@ -59,6 +67,19 @@ def parse_listing_card(card_html: str) -> dict:
         "url": url,
         "text": text,
     }
+
+
+def split_location_date(value: str) -> tuple[str, str]:
+    value = clean_text(value)
+    if " - " in value:
+        location, posted_at = value.split(" - ", 1)
+        return clean_text(location), clean_text(posted_at)
+    return value, ""
+
+
+def is_excluded_location(location: str) -> bool:
+    normalized = clean_text(location).casefold()
+    return any(excluded in normalized for excluded in EXCLUDED_LOCATIONS)
 
 
 def scrape_olx() -> list[dict]:
@@ -154,6 +175,28 @@ def scrape_olx() -> list[dict]:
                             if price:
                                 break
 
+                    location = ""
+                    posted_at = ""
+                    location_date = card.locator('[data-testid="location-date"]').first
+                    if location_date.count():
+                        try:
+                            location, posted_at = split_location_date(location_date.inner_text())
+                        except Exception:
+                            location_date_text = ""
+                    
+                    # Do not send unwanted Warsaw districts.
+                    if is_excluded_location(location):
+                        logger.info("Skipping excluded location: %s", location)
+                        continue
+
+                    size = ""
+                    size_loc = card.locator('span[data-nx-name="P5"]').first
+                    if size_loc.count():
+                        try:
+                            size = clean_text(size_loc.inner_text())
+                        except Exception:
+                            size = ""
+
                     image_url = ""
                     img = card.locator("img").first
                     if img.count():
@@ -170,6 +213,9 @@ def scrape_olx() -> list[dict]:
                             "price": price[:100],
                             "url": url,
                             "image_url": image_url,
+                            "location": location[:200],
+                            "posted_at": posted_at[:200],
+                            "size": size[:50],
                         }
                     )
                 except Exception as exc:
@@ -226,8 +272,19 @@ def telegram_post(method: str, payload: dict) -> dict:
 def send_listing(item: dict) -> None:
     title = item.get("title") or "Новое объявление"
     price = item.get("price") or "Цена не указана"
+    location = item.get("location") or "Локация не указана"
+    posted_at = item.get("posted_at") or "Время не указано"
+    size = item.get("size")
 
-    text = f"🏠 {title}\n💰 {price}"
+    lines = [
+        f"🏠 {title}",
+        f"💰 {price}",
+        f"📍 {location}",
+        f"🕒 {posted_at}",
+    ]
+    if size:
+        lines.append(f"📐 {size}")
+    text = "\n".join(lines)
 
     keyboard = {
         "inline_keyboard": [
