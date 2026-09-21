@@ -20,6 +20,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "sent.json"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "60"))
+MAX_NEW_PER_RUN = int(os.getenv("MAX_NEW_PER_RUN", "10"))
+DETAIL_PAGE_TIMEOUT_MS = int(os.getenv("DETAIL_PAGE_TIMEOUT_MS", "10000"))
 EXCLUDED_LOCATIONS = [
     "praga-południe",
     "praga południe",
@@ -82,61 +84,127 @@ def is_excluded_location(location: str) -> bool:
 
 
 
-def extract_publication_data(detail_page) -> tuple[str, str]:
-    """Return (published_at, modified_at) from an OLX listing detail page.
+def _find_iso_date_in_json(value, keys: tuple[str, ...]) -> str:
+    if isinstance(value, dict):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return clean_text(candidate)
+        for child in value.values():
+            found = _find_iso_date_in_json(child, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_iso_date_in_json(child, keys)
+            if found:
+                return found
+    return ""
 
-    OLX detail pages can expose exact "Data dodania" / "Data modyfikacji"
-    values in the rendered text. We also check common metadata fields first.
+
+def extract_publication_data(detail_page) -> tuple[str, str]:
+    """Return exact publication/modification dates when OLX exposes them.
+
+    We inspect lightweight metadata/JSON first and only then fall back to page
+    text. This avoids the long per-listing timeout that made previous runs
+    appear to hang.
     """
     published_at = ""
     modified_at = ""
 
-    for selector in [
-        'meta[property="article:published_time"]',
-        'meta[itemprop="datePublished"]',
-        'meta[name="datePublished"]',
-    ]:
+    meta_selectors = {
+        "published": [
+            'meta[property="article:published_time"]',
+            'meta[itemprop="datePublished"]',
+            'meta[name="datePublished"]',
+        ],
+        "modified": [
+            'meta[property="article:modified_time"]',
+            'meta[itemprop="dateModified"]',
+            'meta[name="dateModified"]',
+        ],
+    }
+
+    for selector in meta_selectors["published"]:
         try:
-            value = detail_page.locator(selector).first.get_attribute("content") or ""
+            value = detail_page.locator(selector).first.get_attribute("content", timeout=1500) or ""
             if value:
                 published_at = clean_text(value)
                 break
         except Exception:
             pass
 
-    for selector in [
-        'meta[property="article:modified_time"]',
-        'meta[itemprop="dateModified"]',
-        'meta[name="dateModified"]',
-    ]:
+    for selector in meta_selectors["modified"]:
         try:
-            value = detail_page.locator(selector).first.get_attribute("content") or ""
+            value = detail_page.locator(selector).first.get_attribute("content", timeout=1500) or ""
             if value:
                 modified_at = clean_text(value)
                 break
         except Exception:
             pass
 
+    # JSON-LD is usually much cheaper to inspect than a full body text search.
     try:
-        body_text = clean_text(detail_page.locator("body").inner_text(timeout=5_000))
+        scripts = detail_page.locator('script[type="application/ld+json"]').all_inner_texts()
+        for raw in scripts:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if not published_at:
+                published_at = _find_iso_date_in_json(data, ("datePublished", "dateCreated"))
+            if not modified_at:
+                modified_at = _find_iso_date_in_json(data, ("dateModified",))
+            if published_at and modified_at:
+                break
     except Exception:
-        body_text = ""
+        pass
 
-    if not published_at:
-        match = re.search(r"Data dodania\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
-        if match:
-            published_at = match.group(1)
+    # Search the rendered HTML source for date fields before falling back to the
+    # visible body. This is fast and does not wait for extra UI elements.
+    try:
+        html = detail_page.content()
+    except Exception:
+        html = ""
 
-    if not modified_at:
-        match = re.search(r"Data modyfikacji\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
-        if match:
-            modified_at = match.group(1)
+    if html:
+        if not published_at:
+            match = re.search(r'"(?:datePublished|dateCreated)"\s*:\s*"([^"}]+)"', html, re.I)
+            if match:
+                published_at = clean_text(match.group(1))
+        if not modified_at:
+            match = re.search(r'"dateModified"\s*:\s*"([^"}]+)"', html, re.I)
+            if match:
+                modified_at = clean_text(match.group(1))
+
+        if not published_at:
+            match = re.search(r'Data dodania\s*:?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', html, re.I)
+            if match:
+                published_at = match.group(1)
+        if not modified_at:
+            match = re.search(r'Data modyfikacji\s*:?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', html, re.I)
+            if match:
+                modified_at = match.group(1)
+
+    if not published_at or not modified_at:
+        try:
+            body_text = clean_text(detail_page.locator("body").inner_text(timeout=3000))
+        except Exception:
+            body_text = ""
+        if not published_at:
+            match = re.search(r"Data dodania\s*:?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
+            if match:
+                published_at = match.group(1)
+        if not modified_at:
+            match = re.search(r"Data modyfikacji\s*:?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text, re.I)
+            if match:
+                modified_at = match.group(1)
 
     return published_at, modified_at
 
 
 def enrich_publication_data(items: list[dict]) -> list[dict]:
-    """Fetch exact publication dates only for items that are about to be sent."""
+    """Fetch exact dates only for listings that are going to be sent."""
     if not items:
         return items
 
@@ -155,13 +223,23 @@ def enrich_publication_data(items: list[dict]) -> list[dict]:
         try:
             for item in items:
                 try:
-                    page.goto(item["url"], wait_until="domcontentloaded", timeout=45_000)
-                    page.wait_for_timeout(700)
+                    logger.info("Fetching publication date: %s", item.get("id"))
+                    page.goto(
+                        item["url"],
+                        wait_until="domcontentloaded",
+                        timeout=DETAIL_PAGE_TIMEOUT_MS,
+                    )
                     published_at, modified_at = extract_publication_data(page)
                     if published_at:
                         item["published_at"] = published_at
                     if modified_at:
                         item["modified_at"] = modified_at
+                except PlaywrightTimeoutError:
+                    logger.warning(
+                        "Publication page timed out for %s after %.1fs; using card time",
+                        item.get("id"),
+                        DETAIL_PAGE_TIMEOUT_MS / 1000,
+                    )
                 except Exception as exc:
                     logger.warning("Could not fetch publication date for %s: %s", item.get("id"), exc)
         finally:
@@ -444,7 +522,7 @@ def main() -> None:
             return
 
         candidates = [item for item in listings if item["id"] not in sent_ids]
-        latest = candidates[:10]
+        latest = candidates[:MAX_NEW_PER_RUN]
         logger.info("Latest10 mode: %s unseen listings", len(latest))
         latest = enrich_publication_data(latest)
         for item in reversed(latest):
@@ -452,7 +530,7 @@ def main() -> None:
             sent_ids.add(item["id"])
 
         state["initialized"] = True
-        state["sent_ids"] = sorted(set([*sent_ids, *current_ids]))[-2500:]
+        state["sent_ids"] = sorted(sent_ids)[-2500:]
         save_state(state)
         return
 
@@ -472,6 +550,7 @@ def main() -> None:
         return
 
     new_items = [item for item in listings if item["id"] not in sent_ids]
+    new_items = new_items[:MAX_NEW_PER_RUN]
 
     # OLX is sorted newest-first, so Telegram receives the oldest new item first.
     new_items = enrich_publication_data(new_items)
@@ -480,9 +559,8 @@ def main() -> None:
         sent_ids.add(item["id"])
         logger.info("Sent listing %s", item["id"])
 
-    merged = list(dict.fromkeys([*sent_ids, *current_ids]))
     state["initialized"] = True
-    state["sent_ids"] = merged[-2500:]
+    state["sent_ids"] = sorted(sent_ids)[-2500:]
     save_state(state)
 
     logger.info("Done. New listings sent: %s", len(new_items))
