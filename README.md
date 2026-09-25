@@ -1,22 +1,27 @@
-# OLX Telegram Monitor
+# OLX → Telegram monitor
 
-Monitors an OLX Poland rental search page and sends only unseen listings to Telegram.
+This bot monitors an OLX Poland rental search page and sends listings to Telegram.
 
-## Behavior
-- First `monitor` run creates a baseline from current OLX cards and sends **nothing**.
-- Later `monitor` runs send only listing IDs that were not seen before.
-- Excludes: Praga-Południe, Białołęka, Bielany, Bemowo, Ursus.
-- Includes title, price, location, area, OLX refresh time, and (when available on the detail page) exact `Data dodania` / `Data modyfikacji`.
-- `latest10` is a safe manual preview: it only sends unseen listings and does not send already-known old listings. On an uninitialized state it initializes the baseline and sends nothing.
+## Logic
+
+1. `bootstrap_today` is a one-time manual preview. It scans recent OLX cards, reads the exact publication date from the detail page, and sends up to 10 listings published today.
+2. The bot saves a publication watermark such as `2026-09-25T10:05+02:00` plus the IDs published at that exact minute.
+3. Later `monitor` runs send only listings published **after** that watermark. Example: after the last sent listing at `10:05`, a later run sends `10:06`, `10:07`, etc., and ignores yesterday's listings even if OLX refreshes them.
+4. `MAX_NEW_PER_RUN` defaults to 10. The oldest new item is sent first.
+5. The excluded Warsaw districts are: Praga-Południe, Białołęka, Bielany, Bemowo, Ursus.
+
+## Telegram message
+
+Each listing includes title, price, location, publication date/time, optional modification time, area, photo, and a link button.
 
 ## GitHub Secrets
+
 - `OLX_URL`
 - `BOT_TOKEN`
 - `CHAT_ID`
 
-## Run locally
-```bash
-pip install -r requirements.txt
-python -m playwright install --with-deps chromium
-python bot.py
-```
+## Important first run
+
+Because an older repository may already contain the legacy `sent_ids` state, use **Actions → OLX monitor → Run workflow → `bootstrap_today` once** after deploying this version. This ignores the old ID-only history and establishes the new publication-time watermark from today's listings.
+
+After that, let the scheduled `monitor` runs take over.

@@ -1,7 +1,5 @@
 # Security
 
-Never put your Telegram bot token in source code, screenshots, README files, commits, or public issues.
+Never commit `BOT_TOKEN` or `CHAT_ID` values to the repository. Keep them in GitHub Actions Secrets.
 
-Store the token only in GitHub Actions Secrets as `BOT_TOKEN`.
-
-If a token was ever exposed, revoke it with BotFather and create a replacement.
+If a Telegram bot token is ever exposed publicly, revoke it in BotFather and generate a new token.

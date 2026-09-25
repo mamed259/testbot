@@ -1,4 +1,12 @@
-from bot import is_excluded_location, parse_listing_card, split_location_date
+from datetime import datetime
+
+from bot import (
+    is_excluded_location,
+    parse_listing_card,
+    parse_publication_timestamp,
+    split_location_date,
+    is_after_watermark,
+)
 
 
 def test_split_location_date():
@@ -21,3 +29,29 @@ def test_card_id():
     parsed = parse_listing_card(html)
     assert parsed["id"] == "1abc12"
     assert parsed["url"] == "https://www.olx.pl/d/oferta/test-CID3-ID1abc12.html"
+
+
+def test_parse_iso_timestamp():
+    dt = parse_publication_timestamp("2026-09-25T08:03:00Z")
+    assert dt is not None
+    assert dt.strftime("%Y-%m-%d %H:%M") == "2026-09-25 10:03"
+
+
+def test_parse_polish_numeric_timestamp():
+    dt = parse_publication_timestamp("25.09.2026 10:05")
+    assert dt == datetime(2026, 9, 25, 10, 5, tzinfo=dt.tzinfo)
+
+
+def test_parse_polish_long_timestamp():
+    dt = parse_publication_timestamp("25 września 2026 10:05")
+    assert dt is not None
+    assert dt.strftime("%Y-%m-%d %H:%M") == "2026-09-25 10:05"
+
+
+def test_watermark_only_allows_newer_publications():
+    watermark = parse_publication_timestamp("2026-09-25T10:05:00+02:00")
+    assert watermark is not None
+    assert not is_after_watermark({"id": "a", "published_at": "2026-09-25T10:04:00+02:00"}, watermark, set())
+    assert is_after_watermark({"id": "b", "published_at": "2026-09-25T10:06:00+02:00"}, watermark, set())
+    assert not is_after_watermark({"id": "c", "published_at": "2026-09-25T10:05:00+02:00"}, watermark, {"c"})
+    assert is_after_watermark({"id": "d", "published_at": "2026-09-25T10:05:00+02:00"}, watermark, {"c"})
