@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -23,7 +23,7 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "sent.json"))
 MAX_CARDS = int(os.getenv("MAX_CARDS", "60"))
 MAX_NEW_PER_RUN = int(os.getenv("MAX_NEW_PER_RUN", "10"))
-DETAIL_PAGE_TIMEOUT_MS = int(os.getenv("DETAIL_PAGE_TIMEOUT_MS", "7000"))
+DETAIL_PAGE_TIMEOUT_MS = int(os.getenv("DETAIL_PAGE_TIMEOUT_MS", "12000"))
 BOOTSTRAP_SCAN_LIMIT = int(os.getenv("BOOTSTRAP_SCAN_LIMIT", "20"))
 EXCLUDED_LOCATIONS = [
     "praga-południe",
@@ -38,18 +38,9 @@ WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 POLISH_MONTHS = {
-    "stycznia": 1,
-    "lutego": 2,
-    "marca": 3,
-    "kwietnia": 4,
-    "maja": 5,
-    "czerwca": 6,
-    "lipca": 7,
-    "sierpnia": 8,
-    "września": 9,
-    "października": 10,
-    "listopada": 11,
-    "grudnia": 12,
+    "stycznia": 1, "lutego": 2, "marca": 3, "kwietnia": 4,
+    "maja": 5, "czerwca": 6, "lipca": 7, "sierpnia": 8,
+    "września": 9, "października": 10, "listopada": 11, "grudnia": 12,
 }
 
 
@@ -66,16 +57,7 @@ def listing_id(url: str) -> str:
 
 
 def clean_text(value: str) -> str:
-    return " ".join(value.split())
-
-
-def parse_listing_card(card_html: str) -> dict:
-    url_match = re.search(r'href=["\']([^"\']+)["\']', card_html, re.I)
-    if not url_match:
-        raise ValueError("No href in card")
-    url = normalize_url(url_match.group(1))
-    text = clean_text(re.sub(r"<[^>]+>", " ", card_html))
-    return {"id": listing_id(url), "url": url, "text": text}
+    return " ".join((value or "").split())
 
 
 def split_location_date(value: str) -> tuple[str, str]:
@@ -91,13 +73,29 @@ def is_excluded_location(location: str) -> bool:
     return any(excluded in normalized for excluded in EXCLUDED_LOCATIONS)
 
 
+def parse_relative_polish_date(value: str, now: datetime | None = None) -> datetime | None:
+    """Parse relative OLX strings such as 'dzisiaj o 10:05' and 'wczoraj o 23:40'."""
+    value = clean_text(value).casefold()
+    now = now or datetime.now(WARSAW_TZ)
+
+    m = re.search(r"\b(dzisiaj|wczoraj)\s+o\s+(\d{1,2}):(\d{2})\b", value)
+    if not m:
+        return None
+    day_word, hour, minute = m.groups()
+    date = now.date() if day_word == "dzisiaj" else (now - timedelta(days=1)).date()
+    return datetime(date.year, date.month, date.day, int(hour), int(minute), tzinfo=WARSAW_TZ)
+
+
 def parse_publication_timestamp(value: str) -> datetime | None:
-    """Parse common OLX timestamps and return an aware datetime in Warsaw time."""
+    """Parse OLX publication/modified timestamps into Europe/Warsaw."""
     value = clean_text(value)
     if not value:
         return None
 
-    # ISO / JSON timestamps.
+    relative = parse_relative_polish_date(value)
+    if relative:
+        return relative
+
     iso_candidate = value.replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(iso_candidate)
@@ -107,29 +105,21 @@ def parse_publication_timestamp(value: str) -> datetime | None:
     except ValueError:
         pass
 
-    # Polish numeric dates: 22.09.2026 10:05 / 22-09-2026 10:05.
-    match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2}))?", value)
-    if match:
-        day, month, year, hour, minute = match.groups()
-        return datetime(
-            int(year), int(month), int(day), int(hour or 0), int(minute or 0), tzinfo=WARSAW_TZ
-        )
+    m = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2}))?", value)
+    if m:
+        day, month, year, hour, minute = m.groups()
+        return datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), tzinfo=WARSAW_TZ)
 
-    # Polish long-form dates: 22 września 2026 10:05.
-    match = re.fullmatch(
+    m = re.fullmatch(
         r"(\d{1,2})\s+(stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2}))?",
         value,
         re.I,
     )
-    if match:
-        day, month_name, year, hour, minute = match.groups()
+    if m:
+        day, month_name, year, hour, minute = m.groups()
         return datetime(
-            int(year),
-            POLISH_MONTHS[month_name.casefold()],
-            int(day),
-            int(hour or 0),
-            int(minute or 0),
-            tzinfo=WARSAW_TZ,
+            int(year), POLISH_MONTHS[month_name.casefold()], int(day),
+            int(hour or 0), int(minute or 0), tzinfo=WARSAW_TZ,
         )
 
     return None
@@ -138,13 +128,6 @@ def parse_publication_timestamp(value: str) -> datetime | None:
 def publication_sort_key(item: dict):
     dt = parse_publication_timestamp(item.get("published_at", ""))
     return dt or datetime.min.replace(tzinfo=WARSAW_TZ)
-
-
-def is_after_watermark(item: dict, watermark: datetime, watermark_ids: set[str]) -> bool:
-    dt = parse_publication_timestamp(item.get("published_at", ""))
-    if not dt:
-        return False
-    return dt > watermark or (dt == watermark and item["id"] not in watermark_ids)
 
 
 def _find_date_in_json(value, keys: tuple[str, ...]) -> str:
@@ -169,6 +152,7 @@ def extract_publication_data(detail_page) -> tuple[str, str]:
     published_at = ""
     modified_at = ""
 
+    # Metadata first.
     selectors = {
         "published": [
             'meta[property="article:published_time"]',
@@ -181,26 +165,24 @@ def extract_publication_data(detail_page) -> tuple[str, str]:
             'meta[name="dateModified"]',
         ],
     }
-
     for selector in selectors["published"]:
         try:
-            value = detail_page.locator(selector).first.get_attribute("content", timeout=1000) or ""
+            value = detail_page.locator(selector).first.get_attribute("content", timeout=700) or ""
             if value:
                 published_at = clean_text(value)
                 break
         except Exception:
             pass
-
     for selector in selectors["modified"]:
         try:
-            value = detail_page.locator(selector).first.get_attribute("content", timeout=1000) or ""
+            value = detail_page.locator(selector).first.get_attribute("content", timeout=700) or ""
             if value:
                 modified_at = clean_text(value)
                 break
         except Exception:
             pass
 
-    # JSON-LD and embedded page state.
+    # JSON-LD.
     try:
         scripts = detail_page.locator('script[type="application/ld+json"]').all_inner_texts()
         for raw in scripts:
@@ -217,58 +199,69 @@ def extract_publication_data(detail_page) -> tuple[str, str]:
     except Exception:
         pass
 
+    # The OLX rendered text usually contains 'Dodane dzisiaj o 10:05'.
+    try:
+        body_text = clean_text(detail_page.locator("body").inner_text(timeout=2500))
+    except Exception:
+        body_text = ""
+
+    if body_text:
+        if not published_at:
+            patterns = (
+                r"\bDodane\s+(dzisiaj|wczoraj)\s+o\s+(\d{1,2}:\d{2})\b",
+                r"\bDodane\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4})(?:\s+(\d{1,2}:\d{2}))?\b",
+                r"\bData dodania\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?)\b",
+                r"\bData dodania\s*:?\s*(\d{1,2}\s+(?:stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia)\s+\d{4}(?:\s+\d{1,2}:\d{2})?)\b",
+            )
+            for pattern in patterns:
+                m = re.search(pattern, body_text, re.I)
+                if m:
+                    if "dzisiaj" in m.group(0).casefold() or "wczoraj" in m.group(0).casefold():
+                        published_at = clean_text(f"{m.group(1)} o {m.group(2)}")
+                    else:
+                        parts = [group for group in m.groups() if group]
+                        published_at = clean_text(" ".join(parts))
+                    break
+
+        if not modified_at:
+            patterns = (
+                r"\bOdświeżono\s+(dzisiaj|wczoraj)\s+o\s+(\d{1,2}:\d{2})\b",
+                r"\bData modyfikacji\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?)\b",
+            )
+            for pattern in patterns:
+                m = re.search(pattern, body_text, re.I)
+                if m:
+                    if "dzisiaj" in m.group(0).casefold() or "wczoraj" in m.group(0).casefold():
+                        modified_at = clean_text(f"{m.group(1)} o {m.group(2)}")
+                    else:
+                        modified_at = clean_text(m.group(1))
+                    break
+
+    # Try raw HTML as a final fallback, without waiting for a full DOM state.
     try:
         html = detail_page.content()
     except Exception:
         html = ""
+    if html and not published_at:
+        for pattern in (
+            r'"(?:datePublished|dateCreated|createdAt|created_at)"\s*:\s*"([^"]+)"',
+            r'\bDodane\s+(dzisiaj|wczoraj)\s+o\s+(\d{1,2}:\d{2})\b',
+            r'\bDodane\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4})(?:\s+(\d{1,2}:\d{2}))?\b',
+        ):
+            m = re.search(pattern, html, re.I)
+            if m:
+                if len(m.groups()) == 2 and m.group(1).casefold() in {"dzisiaj", "wczoraj"}:
+                    published_at = clean_text(f"{m.group(1)} o {m.group(2)}")
+                else:
+                    published_at = clean_text(" ".join(group for group in m.groups() if group))
+                break
 
-    if html:
-        if not published_at:
-            for pattern in (
-                r'"(?:datePublished|dateCreated|createdAt|created_at)"\s*:\s*"([^"]+)"',
-                r'\bData dodania\b[^<\n]{0,120}?((?:\d{1,2}[./-]\d{1,2}[./-]\d{4})(?:\s+\d{1,2}:\d{2})?)',
-            ):
-                match = re.search(pattern, html, re.I)
-                if match:
-                    published_at = clean_text(match.group(1))
-                    break
-        if not modified_at:
-            match = re.search(r'"(?:dateModified|updatedAt|updated_at)"\s*:\s*"([^"]+)"', html, re.I)
-            if match:
-                modified_at = clean_text(match.group(1))
-
-    if not published_at or not modified_at:
-        try:
-            body_text = clean_text(detail_page.locator("body").inner_text(timeout=1500))
-        except Exception:
-            body_text = ""
-        if not published_at:
-            patterns = (
-                r"Data dodania\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?)",
-                r"Data dodania\s*:?\s*(\d{1,2}\s+(?:stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia)\s+\d{4}(?:\s+\d{1,2}:\d{2})?)",
-            )
-            for pattern in patterns:
-                match = re.search(pattern, body_text, re.I)
-                if match:
-                    published_at = clean_text(match.group(1))
-                    break
-        if not modified_at:
-            match = re.search(
-                r"Data modyfikacji\s*:?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\s+\d{1,2}:\d{2})?)",
-                body_text,
-                re.I,
-            )
-            if match:
-                modified_at = clean_text(match.group(1))
-
-    # Normalize exact timestamps when possible, preserving the original text otherwise.
-    for key, value in (("published_at", published_at), ("modified_at", modified_at)):
-        parsed = parse_publication_timestamp(value)
-        if parsed:
-            if key == "published_at":
-                published_at = parsed.isoformat(timespec="minutes")
-            else:
-                modified_at = parsed.isoformat(timespec="minutes")
+    parsed = parse_publication_timestamp(published_at)
+    if parsed:
+        published_at = parsed.isoformat(timespec="minutes")
+    parsed = parse_publication_timestamp(modified_at)
+    if parsed:
+        modified_at = parsed.isoformat(timespec="minutes")
 
     return published_at, modified_at
 
@@ -276,7 +269,6 @@ def extract_publication_data(detail_page) -> tuple[str, str]:
 def enrich_publication_data(items: list[dict]) -> list[dict]:
     if not items:
         return items
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -293,24 +285,21 @@ def enrich_publication_data(items: list[dict]) -> list[dict]:
             for item in items:
                 try:
                     logger.info("Fetching publication date: %s", item.get("id"))
-                    page.goto(
-                        item["url"],
-                        wait_until="domcontentloaded",
-                        timeout=DETAIL_PAGE_TIMEOUT_MS,
-                    )
+                    # Commit returns as soon as navigation is committed; we do not wait for every asset.
+                    page.goto(item["url"], wait_until="commit", timeout=DETAIL_PAGE_TIMEOUT_MS)
+                    page.wait_for_timeout(800)
                     published_at, modified_at = extract_publication_data(page)
                     if published_at:
                         item["published_at"] = published_at
                     if modified_at:
                         item["modified_at"] = modified_at
                 except PlaywrightTimeoutError:
-                    logger.warning("Publication page timed out for %s; skipping exact date", item.get("id"))
+                    logger.warning("Publication page timed out for %s; continuing", item.get("id"))
                 except Exception as exc:
                     logger.warning("Could not fetch publication date for %s: %s", item.get("id"), exc)
         finally:
             context.close()
             browser.close()
-
     return items
 
 
@@ -331,7 +320,7 @@ def scrape_olx() -> list[dict]:
         try:
             logger.info("Opening OLX search page")
             page.goto(OLX_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1500)
 
             for selector in [
                 'button[data-testid="cookies-policy-accept"]',
@@ -343,7 +332,7 @@ def scrape_olx() -> list[dict]:
                     btn = page.locator(selector).first
                     if btn.is_visible(timeout=600):
                         btn.click(timeout=1200)
-                        page.wait_for_timeout(300)
+                        page.wait_for_timeout(250)
                         break
                 except Exception:
                     pass
@@ -402,7 +391,6 @@ def scrape_olx() -> list[dict]:
                             location, posted_at = split_location_date(location_date.inner_text())
                         except Exception:
                             pass
-
                     if is_excluded_location(location):
                         logger.info("Skipping excluded location: %s", location)
                         continue
@@ -435,7 +423,7 @@ def scrape_olx() -> list[dict]:
                 except Exception as exc:
                     logger.warning("Could not parse card %s: %s", index, exc)
         except PlaywrightTimeoutError:
-            raise RuntimeError("OLX page load timed out")
+            raise RuntimeError("OLX search page load timed out")
         finally:
             context.close()
             browser.close()
@@ -446,20 +434,35 @@ def scrape_olx() -> list[dict]:
     return list(unique.values())
 
 
+def default_state() -> dict:
+    return {
+        "version": 2,
+        "initialized": False,
+        "seen_ids": [],
+        "sent_ids": [],
+    }
+
+
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"initialized": False, "last_published_at": None, "last_published_ids": [], "sent_ids": []}
+        return default_state()
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return {
-            "initialized": bool(data.get("initialized")),
-            "last_published_at": data.get("last_published_at"),
-            "last_published_ids": list(data.get("last_published_ids", [])),
-            "sent_ids": list(data.get("sent_ids", [])),
-        }
     except (json.JSONDecodeError, OSError):
         logger.warning("State file unreadable; starting fresh")
-        return {"initialized": False, "last_published_at": None, "last_published_ids": [], "sent_ids": []}
+        return default_state()
+
+    # v7 state used a timestamp watermark. Migrate it by doing one fresh bootstrap.
+    if data.get("version") != 2 or "seen_ids" not in data:
+        logger.info("Migrating legacy state to v2 snapshot mode")
+        return default_state()
+
+    return {
+        "version": 2,
+        "initialized": bool(data.get("initialized")),
+        "seen_ids": list(data.get("seen_ids", [])),
+        "sent_ids": list(data.get("sent_ids", [])),
+    }
 
 
 def save_state(state: dict) -> None:
@@ -475,41 +478,43 @@ def telegram_post(method: str, payload: dict) -> dict:
     return data
 
 
-def send_listing(item: dict) -> None:
-    title = item.get("title") or "Новое объявление"
-    price = item.get("price") or "Цена не указана"
-    location = item.get("location") or "Локация не указана"
+def format_publication(item: dict) -> str:
     published_at = item.get("published_at")
-    modified_at = item.get("modified_at")
-    posted_at = item.get("posted_at")
-    size = item.get("size")
-
-    lines = [f"🏠 {title}", f"💰 {price}", f"📍 {location}"]
     if published_at:
         parsed = parse_publication_timestamp(published_at)
-        lines.append(
-            f"📅 Dodano: {parsed.strftime('%d.%m.%Y %H:%M') if parsed else published_at}"
-        )
-    else:
-        lines.append("📅 Dodano: nie udało się ustalić dokładnej daty")
-    if modified_at:
-        parsed = parse_publication_timestamp(modified_at)
-        lines.append(
-            f"🔄 Zmodyfikowano: {parsed.strftime('%d.%m.%Y %H:%M') if parsed else modified_at}"
-        )
-    elif posted_at:
-        lines.append(f"🕒 {posted_at}")
-    if size:
-        lines.append(f"📐 {size}")
+        if parsed:
+            return parsed.strftime("%d.%m.%Y %H:%M")
+        return published_at
+    return item.get("posted_at") or "не удалось определить"
 
-    keyboard = {"inline_keyboard": [[{"text": "🔗 Открыть объявление", "url": item["url"]}]]}
+
+def send_listing(item: dict) -> None:
+    lines = [
+        f"🏠 {item.get('title') or 'Новое объявление'}",
+        f"💰 {item.get('price') or 'Цена не указана'}",
+        f"📍 {item.get('location') or 'Локация не указана'}",
+        f"📅 Dodano: {format_publication(item)}",
+    ]
+    if item.get("modified_at"):
+        parsed = parse_publication_timestamp(item["modified_at"])
+        lines.append(f"🔄 Zmodyfikowano: {parsed.strftime('%d.%m.%Y %H:%M') if parsed else item['modified_at']}")
+    if item.get("size"):
+        lines.append(f"📐 {item['size']}")
+
     text = "\n".join(lines)
+    keyboard = {"inline_keyboard": [[{"text": "🔗 Открыть объявление", "url": item["url"]}]]}
     image_url = item.get("image_url") or ""
+
     if image_url.startswith("http"):
         try:
             telegram_post(
                 "sendPhoto",
-                {"chat_id": CHAT_ID, "photo": image_url, "caption": text, "reply_markup": keyboard},
+                {
+                    "chat_id": CHAT_ID,
+                    "photo": image_url,
+                    "caption": text,
+                    "reply_markup": keyboard,
+                },
             )
             return
         except Exception as exc:
@@ -517,121 +522,94 @@ def send_listing(item: dict) -> None:
 
     telegram_post(
         "sendMessage",
-        {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False, "reply_markup": keyboard},
+        {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": False,
+            "reply_markup": keyboard,
+        },
     )
 
 
-def bootstrap_today(listings: list[dict], state: dict) -> None:
-    today = datetime.now(WARSAW_TZ).date()
+def bootstrap(listings: list[dict], state: dict) -> None:
+    """Send today's freshest cards for the first run, then mark the whole snapshot as seen."""
     candidates = listings[:BOOTSTRAP_SCAN_LIMIT]
-    candidates = enrich_publication_data(candidates)
-    today_items = [
-        item for item in candidates
+    enriched = enrich_publication_data(candidates)
+    today = datetime.now(WARSAW_TZ).date()
+
+    exact_today = [
+        item for item in enriched
         if (dt := parse_publication_timestamp(item.get("published_at", ""))) and dt.date() == today
     ]
-    today_items.sort(key=publication_sort_key)
-    today_items = today_items[-MAX_NEW_PER_RUN:]
 
-    if not today_items:
-        raise RuntimeError(
-            "Could not find today's listings with an exact publication date. "
-            "Check OLX detail-page date extraction before continuing."
-        )
+    # If exact publication dates are unavailable, use the top search cards that say 'dzisiaj'.
+    if exact_today:
+        to_send = sorted(exact_today, key=publication_sort_key)[-MAX_NEW_PER_RUN:]
+    else:
+        to_send = [item for item in candidates if "dzisiaj" in item.get("posted_at", "").casefold()][:MAX_NEW_PER_RUN]
+        if not to_send:
+            # The URL itself is sorted by created_at:desc, so use the current top cards rather than failing.
+            to_send = candidates[:MAX_NEW_PER_RUN]
+            logger.warning("Exact publication dates unavailable; using the top current search cards for bootstrap")
 
-    sent_successfully: list[dict] = []
-    for item in today_items:
+        # Keep any successfully extracted dates attached to the items we're about to send.
+        by_id = {item["id"]: item for item in enriched}
+        to_send = [by_id.get(item["id"], item) for item in to_send]
+
+    to_send = list(reversed(to_send))
+    sent_now = 0
+    for item in to_send:
         send_listing(item)
-        sent_successfully.append(item)
+        sent_now += 1
 
-    latest = sent_successfully[-1]
-    latest_dt = parse_publication_timestamp(latest["published_at"])
-    # Treat every listing found at the watermark minute as already present.
-    # This prevents a same-minute old listing (outside the 10-message preview)
-    # from being delivered on the next monitor run.
-    same_time_ids = [
-        item["id"] for item in candidates
-        if parse_publication_timestamp(item.get("published_at", "")) == latest_dt
-    ]
-    state.update(
-        {
-            "initialized": True,
-            "last_published_at": latest_dt.isoformat(timespec="minutes"),
-            "last_published_ids": sorted(same_time_ids),
-        }
-    )
-    state["sent_ids"] = sorted(set(state.get("sent_ids", [])) | {item["id"] for item in sent_successfully})[-2500:]
+    # Bootstrap establishes a clean baseline: everything visible now is old.
+    current_ids = [item["id"] for item in listings]
+    state["seen_ids"] = sorted(set(state.get("seen_ids", [])) | set(current_ids))[-5000:]
+    state["sent_ids"] = sorted(set(state.get("sent_ids", [])) | {item["id"] for item in to_send})[-2500:]
+    state["initialized"] = True
     save_state(state)
-    logger.info("Bootstrap complete: sent %s today's listings; watermark=%s", len(sent_successfully), state["last_published_at"])
+    logger.info("Bootstrap complete: sent=%s, baseline=%s listings", sent_now, len(current_ids))
 
 
 def monitor(listings: list[dict], state: dict) -> None:
-    watermark_text = state.get("last_published_at")
-    if not watermark_text:
-        logger.info("No publication watermark found; bootstrapping today's listings")
-        bootstrap_today(listings, state)
-        return
+    seen = set(state.get("seen_ids", []))
+    new_items = [item for item in listings if item["id"] not in seen]
 
-    watermark = parse_publication_timestamp(watermark_text)
-    if not watermark:
-        raise RuntimeError(f"Invalid last_published_at in state: {watermark_text}")
-    watermark_ids = set(state.get("last_published_ids", []))
-
-    # Only candidates newer than the last publication timestamp are considered.
-    candidates = listings[:BOOTSTRAP_SCAN_LIMIT]
-    candidates = enrich_publication_data(candidates)
-    new_items = []
-    for item in candidates:
-        if is_after_watermark(item, watermark, watermark_ids):
-            new_items.append(item)
-
-    new_items.sort(key=publication_sort_key)
     if not new_items:
-        logger.info("No listings published after %s", watermark.isoformat(timespec="minutes"))
+        logger.info("No new listings")
         return
 
-    new_items = new_items[:MAX_NEW_PER_RUN]
-    last_sent_dt = watermark
-    last_sent_ids = watermark_ids.copy()
+    # Search is newest-first; send oldest of the new batch first so Telegram reads chronologically.
+    new_items = list(reversed(new_items))
+    batch = new_items[:MAX_NEW_PER_RUN]
+    batch = enrich_publication_data(batch)
 
-    for item in new_items:
+    for item in batch:
         send_listing(item)
-        dt = parse_publication_timestamp(item["published_at"])
-        if dt > last_sent_dt:
-            last_sent_dt = dt
-            last_sent_ids = {item["id"]}
-        elif dt == last_sent_dt:
-            last_sent_ids.add(item["id"])
-        state["sent_ids"] = sorted(set(state.get("sent_ids", [])) | {item["id"]})[-2500:]
 
-    state.update(
-        {
-            "initialized": True,
-            "last_published_at": last_sent_dt.isoformat(timespec="minutes"),
-            "last_published_ids": sorted(last_sent_ids),
-        }
-    )
+    state["seen_ids"] = sorted(seen | {item["id"] for item in batch})[-5000:]
+    state["sent_ids"] = sorted(set(state.get("sent_ids", [])) | {item["id"] for item in batch})[-2500:]
     save_state(state)
-    logger.info("Done. New listings sent: %s; watermark=%s", len(new_items), state["last_published_at"])
+    logger.info("Done. New listings sent: %s; remaining new in next runs: %s", len(batch), max(0, len(new_items) - len(batch)))
 
 
 def main() -> None:
-    missing = [
-        name for name, value in (("OLX_URL", OLX_URL), ("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID)) if not value
-    ]
+    missing = [name for name, value in (("OLX_URL", OLX_URL), ("BOT_TOKEN", BOT_TOKEN), ("CHAT_ID", CHAT_ID)) if not value]
     if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+        raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
     logger.info("Starting OLX monitor in mode=%s", MODE)
-    state = load_state()
     listings = scrape_olx()
+    state = load_state()
 
-    if MODE == "bootstrap_today":
-        bootstrap_today(listings, state)
-        return
-    if MODE == "monitor":
+    if MODE in {"bootstrap", "bootstrap_today", "latest10"}:
+        # Explicit bootstrap always uses current top listings.
+        state = default_state()
+        bootstrap(listings, state)
+    elif not state.get("initialized"):
+        bootstrap(listings, state)
+    else:
         monitor(listings, state)
-        return
-    raise RuntimeError(f"Unknown MODE: {MODE}")
 
 
 if __name__ == "__main__":
